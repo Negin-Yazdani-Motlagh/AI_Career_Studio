@@ -1,0 +1,225 @@
+import { ResumeAnswers, ResumeDraft } from "@/lib/types";
+
+export type BrainOutput = {
+  headline: string;
+  targetRolePhrase: string;
+  synthesisGuidance: string;
+};
+
+export type RawCvDraft = {
+  header?: string;
+  headline?: string;
+  contactLine?: string;
+  summary?: string;
+  experienceBlocks?: { headline: string; bullets: string[] }[];
+  experience?: string[];
+  education?: string[];
+  skills?: string[];
+  projects?: string[];
+  leadershipAwards?: string[];
+};
+
+/** Phase 1: strategic read of full intake → guidance for resume writer */
+export function brainSystemPrompt(): string {
+  return `You are a senior career strategist and recruiting specialist (the "brain").
+Your job is to read a student's structured questionnaire intake and produce brief, actionable guidance.
+
+Return ONLY valid JSON with exactly these keys:
+{
+  "headline": "string — one concise professional headline (role/degree + intent, LinkedIn headline style)",
+  "targetRolePhrase": "string — the primary role/industry/target you infer (may be tentative if sparse)",
+  "synthesisGuidance": "string — 2–5 sentences telling a resume writer what to prioritize, emphasize, or de-emphasize; surface gaps; cite strongest proof points."
+}
+
+Rules:
+- Do not invent employers, titles, GPA, credentials, metrics, dates, or degrees not implied by the data.
+- If information is thin, say so in synthesisGuidance and recommend conservative language.
+- Use US professional English.`;
+}
+
+/** Phase 2: full one-page ATS-friendly résumé JSON */
+export function writerSystemPrompt(): string {
+  return `You are an expert ATS-friendly résumé writer for US internships and early-career roles.
+
+Goal: Produce ONE compact page equivalent when rendered (prioritize relevance and measurable impact over completeness).
+
+Mandatory rules:
+- Use only facts supported by student data and brain synthesis; do NOT fabricate metrics, employers, GPA, coursework, certifications, promotions, tenure, titles, URLs, clubs, honors, grades, citizenship, visas, sponsorship, or scholarships.
+- If a field from the questionnaire is blank, omit that content (do not write "none" placeholders).
+- Action-verb bullets; parallel structure; quantify only when explicitly provided by the student.
+- Merge questionnaire "leadership" and "awards/honors" into leadershipAwards (bullets).
+- Telephone and email formatting: professional, single line acceptable in contactLine.
+- experienceBlocks: one block per discrete role/org from experience.entries; headline line format: Role | Organization | Dates (infer date range spans from student's entry text when obvious; otherwise dates may be approximate only if grounded in questionnaire date fields or entry text.)
+- bullets: ATS plain text bullet lines WITHOUT Unicode bullet characters (no •); start each with a hyphen and space "- " instead.
+- skills: dense skill lines grouped as short strings when appropriate ("Languages:", "Technical:", etc.)
+- summary: maximum 3 short sentences OR 350 characters—whichever is tighter.
+- projects: omit section entirely (empty array) if project name/description are essentially empty.
+
+Return ONLY valid JSON with exactly this shape:
+{
+  "header": "Full name ONLY",
+  "headline": "string",
+  "contactLine": "Email | Phone | LinkedIn/GitHub/portfolio fragments as supplied",
+  "summary": "string",
+  "experienceBlocks": [{"headline": "string", "bullets": ["string", "..."]}],
+  "education": ["string"],
+  "skills": ["string"],
+  "projects": ["string"],
+  "leadershipAwards": ["string"]
+}`;
+}
+
+export function parseBrainJson(raw: string): BrainOutput | null {
+  try {
+    const parsed = JSON.parse(raw) as BrainOutput;
+    if (
+      typeof parsed.headline === "string" &&
+      typeof parsed.targetRolePhrase === "string" &&
+      typeof parsed.synthesisGuidance === "string"
+    ) {
+      return parsed;
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+function flattenExperience(raw: RawCvDraft): string[] {
+  if (raw.experienceBlocks?.length) {
+    return raw.experienceBlocks.flatMap((block) => {
+      const head = block.headline?.trim() ?? "";
+      const bullets = Array.isArray(block.bullets) ? block.bullets : [];
+      return [head, ...bullets.map((b) => b.trim()).filter(Boolean)];
+    });
+  }
+  return Array.isArray(raw.experience) ? [...raw.experience] : [];
+}
+
+export function normalizeWriterOutput(raw: unknown, answers: ResumeAnswers): ResumeDraft {
+  const incoming = raw as RawCvDraft;
+  const blocks = incoming.experienceBlocks?.filter(
+    (b) => b.headline?.trim() && Array.isArray(b.bullets),
+  );
+
+  return {
+    header: (incoming.header ?? "").trim() || fallbackName(answers),
+    headline: incoming.headline?.trim(),
+    contactLine: incoming.contactLine?.trim(),
+    summary: (incoming.summary ?? "").trim(),
+    education: Array.isArray(incoming.education) ? incoming.education.filter(Boolean) : [],
+    skills: Array.isArray(incoming.skills) ? incoming.skills.filter(Boolean) : [],
+    projects: Array.isArray(incoming.projects) ? incoming.projects.filter(Boolean) : [],
+    leadershipAwards: Array.isArray(incoming.leadershipAwards)
+      ? incoming.leadershipAwards.filter(Boolean)
+      : [],
+    experienceBlocks:
+      blocks && blocks.length > 0
+        ? blocks.map((b) => ({
+            headline: (b.headline ?? "").trim(),
+            bullets: (b.bullets ?? []).map((x) => x.trim()).filter(Boolean),
+          }))
+        : undefined,
+    experience: flattenExperience(incoming),
+  };
+}
+
+export function fallbackName(answers: ResumeAnswers): string {
+  return `${answers.basicInfo.firstName} ${answers.basicInfo.lastName}`.trim() || "Student Name";
+}
+
+export function buildFallbackIndustryDraft(answers: ResumeAnswers): ResumeDraft {
+  const name = fallbackName(answers);
+  const contactParts = [
+    answers.basicInfo.email,
+    answers.basicInfo.phoneNumber,
+    answers.basicInfo.linkedinProfile,
+    answers.basicInfo.portfolioGithub,
+  ]
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const experienceBlocks = answers.experience.entries.map((entry) => {
+    const dates = ""; // questionnaire doesn't have per-entry dates
+    const head = [entry.role, entry.organization, dates].filter(Boolean).join(" · ");
+    const bullets: string[] = [];
+    if (entry.responsibilities?.trim()) {
+      bullets.push(`- ${entry.responsibilities.trim()}`);
+    }
+    if (entry.toolsUsed?.trim()) {
+      bullets.push(`- Tools: ${entry.toolsUsed.trim()}`);
+    }
+    if (entry.impact?.trim()) {
+      bullets.push(`- ${entry.impact.trim()}`);
+    }
+    const typePrefix = entry.type ? `${entry.type}: ` : "";
+    return {
+      headline: `${typePrefix}${head}`.trim() || "Experience",
+      bullets,
+    };
+  });
+
+  const leadershipLines: string[] = [];
+  if (answers.leadershipActivities.activities?.trim()) {
+    leadershipLines.push(`- Activities: ${answers.leadershipActivities.activities.trim()}`);
+  }
+  if (answers.leadershipActivities.leadershipRoles?.trim()) {
+    leadershipLines.push(`- Leadership: ${answers.leadershipActivities.leadershipRoles.trim()}`);
+  }
+  if (answers.leadershipActivities.impact?.trim()) {
+    leadershipLines.push(`- Impact: ${answers.leadershipActivities.impact.trim()}`);
+  }
+  if (answers.awardsHonors.awards?.trim()) {
+    leadershipLines.push(`- Awards: ${answers.awardsHonors.awards.trim()}`);
+  }
+  if (answers.awardsHonors.honors?.trim()) {
+    leadershipLines.push(`- Honors: ${answers.awardsHonors.honors.trim()}`);
+  }
+
+  const major = answers.education.major?.trim();
+
+  const draft: ResumeDraft = {
+    header: name,
+    headline:
+      major
+        ? `${major} Candidate — seeking internship and career opportunities`
+        : "Student Candidate — seeking internship and career opportunities",
+    contactLine: contactParts.join(" | "),
+    summary: major
+      ? `Motivated ${major} student with strengths in coursework and applied projects; eager to contribute in internships and cooperative education roles. Ready to tailor messaging for target employers with advisor feedback.`
+      : `Motivated student preparing for internships and cooperative education roles.`,
+    education: [
+      `${answers.education.university || "University"} — ${answers.education.major || "Major"}${answers.education.minors?.trim() ? `; Minor(s): ${answers.education.minors.trim()}` : ""}`,
+      `${answers.education.startDate?.trim() || "Start"} — ${answers.education.graduationDate?.trim() || "Graduation expected"}`,
+      ...(answers.education.gpa?.trim()
+        ? [`GPA: ${answers.education.gpa.trim()}`]
+        : []),
+      ...(answers.education.coursework?.trim()
+        ? [`Relevant coursework: ${answers.education.coursework.trim()}`]
+        : []),
+    ],
+    skills: [
+      answers.skills.technicalSkills?.trim()
+        ? `Technical: ${answers.skills.technicalSkills.trim()}`
+        : "",
+      answers.skills.tools?.trim() ? `Tools & platforms: ${answers.skills.tools.trim()}` : "",
+      answers.skills.languages?.trim() ? `Languages: ${answers.skills.languages.trim()}` : "",
+      answers.skills.softSkills?.trim()
+        ? `Professional skills: ${answers.skills.softSkills.trim()}`
+        : "",
+    ].filter(Boolean),
+    experienceBlocks: experienceBlocks.length ? experienceBlocks : undefined,
+    experience: experienceBlocks.flatMap((b) => [b.headline, ...b.bullets]),
+    projects: [
+      answers.projects.projectName?.trim() || "",
+      answers.projects.description?.trim() || "",
+      answers.projects.tools?.trim()
+        ? `Tools: ${answers.projects.tools.trim()}`
+        : "",
+      answers.projects.outcome?.trim() ? `Outcome: ${answers.projects.outcome.trim()}` : "",
+    ].filter(Boolean),
+    leadershipAwards: leadershipLines,
+  };
+
+  return draft;
+}
